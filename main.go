@@ -1,874 +1,581 @@
 package main
 
-// ---------------------------------------------------------------------------
-// LatticePGP (lpgp) — Post-Quantum Secure Asymmetric Encryption & Signing
-// ---------------------------------------------------------------------------
-//
-// Algorithm : Unified Ring-LWE (Learning With Errors over Polynomial Rings)
-// Ring      : Z_q[x] / (x^256 + 1)
-// Modulus   : q = 8380417 (prime, 2n | q-1, large enough for both Enc & Sig)
-// Error     : uniform in {-2, …, 2}
-// Hybrid    : Ring-LWE encapsulation + AES-256-GCM
-// Signature : Fiat-Shamir with Aborts (Dilithium-like)
-//
-// Security  : Post-quantum ~128-bit equivalent.
-// ---------------------------------------------------------------------------
-
 import (
-    "bytes"
-    "crypto/aes"
-    "crypto/cipher"
-    "crypto/rand"
-    "crypto/sha256"
-    "encoding/base64"
-    "encoding/binary"
-    "flag"
-    "fmt"
-    "os"
-    "strings"
-)
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/mlkem"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strings"
 
-// ────────────────────────── parameters ──────────────────────────
+	circlsign "github.com/cloudflare/circl/sign"
+	signschemes "github.com/cloudflare/circl/sign/schemes"
+)
 
 const (
-    N      = 256     // polynomial degree
-    Q      = 8380417 // modulus (prime, fits Dilithium/Kyber paradigms)
-    HALF_Q = 4190208
-    B      = 2       // error bound for keygen
-    KeyLen = 32      // AES-256
+	version = 2
 
-    GAMMA1  = 131072    // 2^17, bound for signature random poly y
-    Z_BOUND = 131072 - 120 // bound for signature z after rejection
-    D_ROUND = 2048      // rounding divisor for signature compression
-    TAU     = 60        // number of ±1 coefficients in signature challenge
+	magicPub = "LPPB"
+	magicSec = "LPSB"
+	magicCT  = "LPCM"
+	magicSig = "LPSG"
 
-    MagicPK  = "LTPK"
-    MagicSK  = "LTSK"
-    MagicCT  = "LTCT"
-    MagicSIG = "LTSG"
-    Version  = 1
+	pubBlock = "PUBLIC KEY BLOCK"
+	secBlock = "SECRET KEY BLOCK"
+	ctBlock  = "ENCRYPTED MESSAGE BLOCK"
+	sigBlock = "SIGNATURE BLOCK"
+
+	sigSchemeName = "ML-DSA-65"
+	sigContext    = "LPGP-SIG-v2"
+	encAAD        = "LPGP-ENC-v2"
 )
 
-// ────────────────────────── polynomial type ──────────────────────────
+var sigScheme = signschemes.ByName(sigSchemeName)
 
-type Poly [N]int64
+func main() {
+	if sigScheme == nil {
+		fatalf("signature scheme %q not available", sigSchemeName)
+	}
 
-func modQ(x int64) int64 {
-    r := x % Q
-    if r < 0 {
-        r += Q
-    }
-    return r
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "keygen":
+		cmdKeygen()
+	case "encrypt":
+		cmdEncrypt()
+	case "decrypt":
+		cmdDecrypt()
+	case "sign":
+		cmdSign()
+	case "verify":
+		cmdVerify()
+	case "help", "-h", "--help":
+		usage()
+	default:
+		fatalf("unknown command: %s", os.Args[1])
+	}
 }
-
-func (p *Poly) reduceModQ() {
-    for i := 0; i < N; i++ {
-        p[i] = modQ(p[i])
-    }
-}
-
-func (p *Poly) center() {
-    for i := 0; i < N; i++ {
-        if p[i] > Q/2 {
-            p[i] -= Q
-        }
-    }
-}
-
-func polyAdd(a, b *Poly) Poly {
-    var c Poly
-    for i := 0; i < N; i++ {
-        c[i] = a[i] + b[i]
-    }
-    return c
-}
-
-func polySub(a, b *Poly) Poly {
-    var c Poly
-    for i := 0; i < N; i++ {
-        c[i] = a[i] - b[i]
-    }
-    return c
-}
-
-func polyMul(a, b *Poly) Poly {
-    var tmp [2*N - 1]int64
-    for i := 0; i < N; i++ {
-        if a[i] == 0 {
-            continue
-        }
-        ai := a[i]
-        for j := 0; j < N; j++ {
-            tmp[i+j] += ai * b[j]
-        }
-    }
-    var c Poly
-    for i := 0; i < N; i++ {
-        c[i] = tmp[i]
-    }
-    for i := N; i < 2*N-1; i++ {
-        c[i-N] -= tmp[i] // x^N = −1
-    }
-    c.reduceModQ()
-    return c
-}
-
-func roundPolyCentered(p *Poly, D int64) [N]int64 {
-    var out [N]int64
-    for i := 0; i < N; i++ {
-        val := p[i]
-        if val >= 0 {
-            out[i] = (val + D/2) / D
-        } else {
-            out[i] = -(-val + D/2) / D
-        }
-    }
-    return out
-}
-
-// ────────────────────────── random & hash ──────────────────────────
-
-func mustRand(n int) []byte {
-    buf := make([]byte, n)
-    if _, err := rand.Read(buf); err != nil {
-        panic("crypto/rand: " + err.Error())
-    }
-    return buf
-}
-
-func randPolyQ() Poly {
-    var p Poly
-    buf := mustRand(N * 4)
-    for i := 0; i < N; i++ {
-        p[i] = int64(binary.LittleEndian.Uint32(buf[4*i:])) % Q
-    }
-    return p
-}
-
-func errPoly() Poly {
-    var p Poly
-    buf := mustRand(N)
-    for i := 0; i < N; i++ {
-        p[i] = int64(buf[i]%(2*B+1)) - int64(B)
-    }
-    return p
-}
-
-func randPolyY() Poly {
-    var p Poly
-    buf := mustRand(N * 4)
-    for i := 0; i < N; i++ {
-        val := int64(binary.LittleEndian.Uint32(buf[4*i:])) % (2 * GAMMA1)
-        p[i] = val - GAMMA1
-    }
-    return p
-}
-
-// expandSeed deterministically generates a sparse challenge polynomial with TAU non-zero ±1 coefficients.
-func expandSeed(cSeed []byte) Poly {
-    var c Poly
-    used := [N]bool{}
-    indices := make([]int, 0, TAU)
-    counter := 0
-    buf := []byte{}
-
-    for len(indices) < TAU {
-        if len(buf) < 2 {
-            h := sha256.Sum256(append(append([]byte{}, cSeed...), byte(counter)))
-            counter++
-            buf = append(buf, h[:]...)
-        }
-        idx := int(buf[0])<<8 | int(buf[1])
-        buf = buf[2:]
-        idx = idx % N
-        if !used[idx] {
-            used[idx] = true
-            indices = append(indices, idx)
-        }
-    }
-    for len(buf) < TAU {
-        h := sha256.Sum256(append(append([]byte{}, cSeed...), byte(counter)))
-        counter++
-        buf = append(buf, h[:]...)
-    }
-    for i, idx := range indices {
-        sign := buf[i] & 1
-        if sign == 0 {
-            c[idx] = 1
-        } else {
-            c[idx] = -1
-        }
-    }
-    return c
-}
-
-func hashW1Msg(w1 *[N]int64, msg []byte) []byte {
-    h := sha256.New()
-    buf := make([]byte, 4)
-    for i := 0; i < N; i++ {
-        binary.LittleEndian.PutUint32(buf, uint32(int32(w1[i])))
-        h.Write(buf)
-    }
-    h.Write(msg)
-    return h.Sum(nil)
-}
-
-// ────────────────────────── key types ──────────────────────────
-
-type PublicKey struct {
-    A Poly
-    T Poly
-}
-
-type SecretKey struct {
-    A Poly
-    S Poly
-    E Poly
-    T Poly // Required for signing operations!
-}
-
-func KeyGen() (PublicKey, SecretKey) {
-    a := randPolyQ()
-    s := errPoly()
-    e := errPoly()
-    as := polyMul(&a, &s)
-    t := polyAdd(&as, &e)
-    t.reduceModQ()
-    return PublicKey{A: a, T: t}, SecretKey{A: a, S: s, E: e, T: t}
-}
-
-// ────────────────────────── encryption ──────────────────────────
-
-type RLWECiphertext struct {
-    U Poly
-    V Poly
-}
-
-func EncryptKey(pk *PublicKey, key []byte) RLWECiphertext {
-    r := errPoly()
-    e1 := errPoly()
-    e2 := errPoly()
-
-    ar := polyMul(&pk.A, &r)
-    u := polyAdd(&ar, &e1)
-    u.reduceModQ()
-
-    var m Poly
-    for i := 0; i < 256; i++ {
-        if (key[i/8]>>(7-uint(i%8)))&1 == 1 {
-            m[i] = int64(HALF_Q)
-        }
-    }
-
-    tr := polyMul(&pk.T, &r)
-    trE2 := polyAdd(&tr, &e2)
-    v := polyAdd(&trE2, &m)
-    v.reduceModQ()
-
-    return RLWECiphertext{U: u, V: v}
-}
-
-func DecryptKey(sk *SecretKey, ct RLWECiphertext) []byte {
-    su := polyMul(&sk.S, &ct.U)
-    d := polySub(&ct.V, &su)
-    d.reduceModQ()
-
-    key := make([]byte, KeyLen)
-    for i := 0; i < 256; i++ {
-        c := d[i]
-        if c >= int64(Q)/4 && c <= 3*int64(Q)/4 {
-            key[i/8] |= 1 << (7 - uint(i%8))
-        }
-    }
-    return key
-}
-
-// ────────────────────────── signing ──────────────────────────
-
-func packDelta(delta []int8) []byte {
-    out := make([]byte, 64)
-    for i, d := range delta {
-        v := byte(d + 1) // -1->0, 0->1, 1->2
-        byteIdx := i / 4
-        bitIdx := (i % 4) * 2
-        out[byteIdx] |= v << bitIdx
-    }
-    return out
-}
-
-func unpackDelta(data []byte) []int8 {
-    delta := make([]int8, N)
-    for i := 0; i < N; i++ {
-        byteIdx := i / 4
-        bitIdx := (i % 4) * 2
-        v := (data[byteIdx] >> bitIdx) & 3
-        delta[i] = int8(v) - 1
-    }
-    return delta
-}
-
-func Sign(sk *SecretKey, msg []byte) ([]byte, error) {
-    for {
-        y := randPolyY()
-        ay := polyMul(&sk.A, &y)
-        ay.reduceModQ()
-        ay.center()
-
-        w1 := roundPolyCentered(&ay, D_ROUND)
-        cSeed := hashW1Msg(&w1, msg)
-        c := expandSeed(cSeed)
-
-        cs := polyMul(&c, &sk.S)
-        z := polyAdd(&y, &cs)
-
-        valid := true
-        for i := 0; i < N; i++ {
-            if z[i] < -Z_BOUND || z[i] > Z_BOUND {
-                valid = false
-                break
-            }
-        }
-        if !valid {
-            continue // Rejection sampling
-        }
-
-        az := polyMul(&sk.A, &z)
-        az.reduceModQ()
-        az.center()
-
-        ct := polyMul(&c, &sk.T)
-        ct.reduceModQ()
-        ct.center()
-
-        wPrime := polySub(&az, &ct)
-        wPrime.center()
-
-        w1Prime := roundPolyCentered(&wPrime, D_ROUND)
-
-        var delta [N]int8
-        for i := 0; i < N; i++ {
-            delta[i] = int8(w1[i] - w1Prime[i])
-        }
-
-        packedDelta := packDelta(delta[:])
-        out := make([]byte, 0, 6+N*4+32+64)
-        out = append(out, MagicSIG...)
-        out = append(out, byte(Version>>8), byte(Version))
-        out = append(out, polyToBytes(&z)...)
-        out = append(out, cSeed...)
-        out = append(out, packedDelta...)
-        return out, nil
-    }
-}
-
-func Verify(pk *PublicKey, sigData []byte, msg []byte) (bool, error) {
-    if len(sigData) < 6+N*4+32+64 {
-        return false, fmt.Errorf("signature too short")
-    }
-    if string(sigData[:4]) != MagicSIG {
-        return false, fmt.Errorf("bad signature magic")
-    }
-
-    z := polyFromBytes(sigData[6 : 6+N*4])
-    cSeed := sigData[6+N*4 : 6+N*4+32]
-    packedDelta := sigData[6+N*4+32 : 6+N*4+32+64]
-
-    for i := 0; i < N; i++ {
-        if z[i] < -Z_BOUND || z[i] > Z_BOUND {
-            return false, nil
-        }
-    }
-
-    c := expandSeed(cSeed)
-    delta := unpackDelta(packedDelta)
-
-    az := polyMul(&pk.A, &z)
-    az.reduceModQ()
-    az.center()
-
-    ct := polyMul(&c, &pk.T)
-    ct.reduceModQ()
-    ct.center()
-
-    wPrime := polySub(&az, &ct)
-    wPrime.center()
-
-    w1Prime := roundPolyCentered(&wPrime, D_ROUND)
-
-    var w1 [N]int64
-    for i := 0; i < N; i++ {
-        w1[i] = w1Prime[i] + int64(delta[i])
-    }
-
-    expectedCSeed := hashW1Msg(&w1, msg)
-    return bytes.Equal(cSeed, expectedCSeed), nil
-}
-
-// ────────────────────────── serialization ──────────────────────────
-
-func polyToBytes(p *Poly) []byte {
-    buf := make([]byte, N*4)
-    for i := 0; i < N; i++ {
-        binary.LittleEndian.PutUint32(buf[4*i:], uint32(int32(p[i])))
-    }
-    return buf
-}
-
-func polyFromBytes(buf []byte) Poly {
-    var p Poly
-    for i := 0; i < N; i++ {
-        p[i] = int64(int32(binary.LittleEndian.Uint32(buf[4*i:])))
-    }
-    return p
-}
-
-func (pk *PublicKey) Marshal() []byte {
-    out := make([]byte, 0, 14+N*8)
-    out = append(out, MagicPK...)
-    out = append(out, byte(Version>>8), byte(Version))
-    var tmp [4]byte
-    binary.BigEndian.PutUint32(tmp[:], uint32(N))
-    out = append(out, tmp[:]...)
-    binary.BigEndian.PutUint32(tmp[:], uint32(Q))
-    out = append(out, tmp[:]...)
-    out = append(out, polyToBytes(&pk.A)...)
-    out = append(out, polyToBytes(&pk.T)...)
-    return out
-}
-
-func UnmarshalPublicKey(data []byte) (*PublicKey, error) {
-    if len(data) < 14+N*8 {
-        return nil, fmt.Errorf("public key data too short")
-    }
-    if string(data[:4]) != MagicPK {
-        return nil, fmt.Errorf("bad public key magic")
-    }
-    if v := uint16(data[4])<<8 | uint16(data[5]); v != Version {
-        return nil, fmt.Errorf("unsupported version")
-    }
-    a := polyFromBytes(data[14 : 14+N*4])
-    t := polyFromBytes(data[14+N*4 : 14+N*8])
-    return &PublicKey{A: a, T: t}, nil
-}
-
-func (sk *SecretKey) Marshal() []byte {
-    out := make([]byte, 0, 14+N*16) // Now contains 4 polynomials: A, S, E, T
-    out = append(out, MagicSK...)
-    out = append(out, byte(Version>>8), byte(Version))
-    var tmp [4]byte
-    binary.BigEndian.PutUint32(tmp[:], uint32(N))
-    out = append(out, tmp[:]...)
-    binary.BigEndian.PutUint32(tmp[:], uint32(Q))
-    out = append(out, tmp[:]...)
-    out = append(out, polyToBytes(&sk.A)...)
-    out = append(out, polyToBytes(&sk.S)...)
-    out = append(out, polyToBytes(&sk.E)...)
-    out = append(out, polyToBytes(&sk.T)...)
-    return out
-}
-
-func UnmarshalSecretKey(data []byte) (*SecretKey, error) {
-    if len(data) < 14+N*16 { // Updated length check
-        return nil, fmt.Errorf("secret key data too short")
-    }
-    if string(data[:4]) != MagicSK {
-        return nil, fmt.Errorf("bad secret key magic")
-    }
-    if v := uint16(data[4])<<8 | uint16(data[5]); v != Version {
-        return nil, fmt.Errorf("unsupported version")
-    }
-    a := polyFromBytes(data[14 : 14+N*4])
-    s := polyFromBytes(data[14+N*4 : 14+N*8])
-    e := polyFromBytes(data[14+N*8 : 14+N*12])
-    t := polyFromBytes(data[14+N*12 : 14+N*16])
-    return &SecretKey{A: a, S: s, E: e, T: t}, nil
-}
-
-// ────────────────────────── hybrid encrypt / decrypt ──────────────────────────
-
-func EncryptMessage(pk *PublicKey, plaintext []byte) ([]byte, error) {
-    symKey := mustRand(KeyLen)
-    rlwe := EncryptKey(pk, symKey)
-
-    block, err := aes.NewCipher(symKey)
-    if err != nil {
-        return nil, err
-    }
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return nil, err
-    }
-    iv := mustRand(gcm.NonceSize())
-    aesCT := gcm.Seal(nil, iv, plaintext, nil)
-
-    out := make([]byte, 0, 22+N*8+len(aesCT))
-    out = append(out, MagicCT...)
-    out = append(out, byte(Version>>8), byte(Version))
-    out = append(out, iv...)
-    var lbuf [4]byte
-    binary.BigEndian.PutUint32(lbuf[:], uint32(len(aesCT)))
-    out = append(out, lbuf[:]...)
-    out = append(out, polyToBytes(&rlwe.U)...)
-    out = append(out, polyToBytes(&rlwe.V)...)
-    out = append(out, aesCT...)
-
-    for i := range symKey {
-        symKey[i] = 0
-    }
-    return out, nil
-}
-
-func DecryptMessage(sk *SecretKey, data []byte) ([]byte, error) {
-    if len(data) < 22+N*8 {
-        return nil, fmt.Errorf("ciphertext too short")
-    }
-    if string(data[:4]) != MagicCT {
-        return nil, fmt.Errorf("bad ciphertext magic")
-    }
-    if v := uint16(data[4])<<8 | uint16(data[5]); v != Version {
-        return nil, fmt.Errorf("unsupported version")
-    }
-    iv := data[6:18]
-    aesLen := binary.BigEndian.Uint32(data[18:22])
-
-    u := polyFromBytes(data[22 : 22+N*4])
-    v := polyFromBytes(data[22+N*4 : 22+N*8])
-
-    symKey := DecryptKey(sk, RLWECiphertext{U: u, V: v})
-
-    aesStart := 22 + N*8
-    if len(data) < aesStart+int(aesLen) {
-        return nil, fmt.Errorf("ciphertext truncated")
-    }
-    aesCT := data[aesStart : aesStart+int(aesLen)]
-
-    block, err := aes.NewCipher(symKey)
-    if err != nil {
-        return nil, err
-    }
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return nil, err
-    }
-    return gcm.Open(nil, iv, aesCT, nil)
-}
-
-// ────────────────────────── ASCII Armor (PGP Style) ──────────────────────────
-
-func Armor(blockType string, data []byte) string {
-    b64 := base64.StdEncoding.EncodeToString(data)
-    var sb strings.Builder
-    sb.WriteString("-----BEGIN LPGP " + blockType + "-----\n")
-    sb.WriteString("Version: LatticePGP v1.0 (Ring-LWE N=256 Q=8380417)\n\n")
-    for i := 0; i < len(b64); i += 76 {
-        end := i + 76
-        if end > len(b64) {
-            end = len(b64)
-        }
-        sb.WriteString(b64[i:end])
-        sb.WriteString("\n")
-    }
-    sb.WriteString("-----END LPGP " + blockType + "-----\n")
-    return sb.String()
-}
-
-func Dearmor(text string) (string, []byte, error) {
-    lines := strings.Split(text, "\n")
-    var blockType string
-    var dataLines []string
-    inBlock := false
-    headerDone := false
-
-    for _, line := range lines {
-        line = strings.TrimRight(line, "\r")
-        if !inBlock {
-            if strings.HasPrefix(line, "-----BEGIN LPGP ") && strings.HasSuffix(line, "-----") {
-                blockType = strings.TrimPrefix(line, "-----BEGIN LPGP ")
-                blockType = strings.TrimSuffix(blockType, "-----")
-                inBlock = true
-            }
-            continue
-        }
-        if strings.HasPrefix(line, "-----END LPGP ") {
-            break
-        }
-        if !headerDone {
-            if strings.TrimSpace(line) == "" {
-                headerDone = true
-            }
-            continue
-        }
-        dataLines = append(dataLines, line)
-    }
-
-    if !inBlock || !headerDone {
-        return "", nil, fmt.Errorf("invalid ascii armor format")
-    }
-    b64 := strings.Join(dataLines, "")
-    data, err := base64.StdEncoding.DecodeString(b64)
-    if err != nil {
-        return "", nil, fmt.Errorf("base64 decode error: %w", err)
-    }
-    return blockType, data, nil
-}
-
-func readFileOrStdin(path string) ([]byte, error) {
-    if path == "-" || path == "" {
-        return os.ReadFile("/dev/stdin")
-    }
-    return os.ReadFile(path)
-}
-
-func writeFileOrStdout(path string, data []byte) error {
-    if path == "-" || path == "" {
-        _, err := os.Stdout.Write(data)
-        return err
-    }
-    return os.WriteFile(path, data, 0644)
-}
-
-// ────────────────────────── CLI ──────────────────────────
 
 func usage() {
-    fmt.Fprintf(os.Stderr, `lpgp — LatticePGP: Post-Quantum Encryption & Signing
-===================================================
-Algorithm : Unified Ring-LWE (N=256, Q=8380417)
-Usage:
-  lpgp keygen   [-name BASENAME]
-  lpgp encrypt  -pubkey FILE [-in FILE] [-out FILE]
-  lpgp decrypt  -seckey FILE [-in FILE] [-out FILE]
-  lpgp sign     -seckey FILE [-in FILE] [-out FILE]
-  lpgp verify   -pubkey FILE -sig FILE [-in FILE]
+	fmt.Fprintf(os.Stderr, `lpgp — Post-Quantum Encryption & Signing
 
-Use "-" for stdin/stdout.
+Algorithms:
+  Encrypt: ML-KEM-768 + AES-256-GCM
+  Sign   : ML-DSA-65
+
+Usage:
+  lpgp keygen  [-name BASENAME]
+  lpgp encrypt -pubkey FILE [-in FILE] [-out FILE]
+  lpgp decrypt -seckey FILE [-in FILE] [-out FILE]
+  lpgp sign    -seckey FILE [-in FILE] [-out FILE]
+  lpgp verify  -pubkey FILE -sig FILE [-in FILE]
+
+If -in/-out are omitted, stdin/stdout are used.
 `)
 }
 
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+func mustRand(n int) []byte {
+	b := make([]byte, n)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		fatalf("crypto/rand failed: %v", err)
+	}
+	return b
+}
+
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+func readFileOrStdin(path string) ([]byte, error) {
+	if path == "" || path == "-" {
+		return io.ReadAll(os.Stdin)
+	}
+	return os.ReadFile(path)
+}
+
+func writeFileOrStdout(path string, data []byte, mode os.FileMode) error {
+	if path == "" || path == "-" {
+		_, err := os.Stdout.Write(data)
+		return err
+	}
+	return os.WriteFile(path, data, mode)
+}
+
+// ---------- strict record framing ----------
+
+func encodeRecord(magic string, parts ...[]byte) []byte {
+	var buf bytes.Buffer
+	buf.WriteString(magic)
+	buf.WriteByte(version)
+	buf.WriteByte(byte(len(parts)))
+	for _, p := range parts {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(p)))
+		buf.Write(n[:])
+		buf.Write(p)
+	}
+	return buf.Bytes()
+}
+
+func decodeRecord(data []byte, wantMagic string, wantParts int) ([][]byte, error) {
+	if len(data) < 6 {
+		return nil, errors.New("record too short")
+	}
+	if string(data[:4]) != wantMagic {
+		return nil, errors.New("bad magic")
+	}
+	if int(data[4]) != version {
+		return nil, fmt.Errorf("unsupported version %d", data[4])
+	}
+	if int(data[5]) != wantParts {
+		return nil, errors.New("wrong part count")
+	}
+
+	parts := make([][]byte, 0, wantParts)
+	rest := data[6:]
+	for i := 0; i < wantParts; i++ {
+		if len(rest) < 4 {
+			return nil, errors.New("truncated record")
+		}
+		n := int(binary.BigEndian.Uint32(rest[:4]))
+		rest = rest[4:]
+		if n < 0 || len(rest) < n {
+			return nil, errors.New("invalid record length")
+		}
+		parts = append(parts, append([]byte(nil), rest[:n]...))
+		rest = rest[n:]
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("trailing garbage in record")
+	}
+	return parts, nil
+}
+
+// ---------- ascii armor ----------
+
+func armor(blockType string, data []byte) string {
+	b64 := base64.StdEncoding.EncodeToString(data)
+	var sb strings.Builder
+	sb.WriteString("-----BEGIN LPGP " + blockType + "-----\n")
+	sb.WriteString("Version: LatticePGP v2\n\n")
+	for i := 0; i < len(b64); i += 76 {
+		j := i + 76
+		if j > len(b64) {
+			j = len(b64)
+		}
+		sb.WriteString(b64[i:j])
+		sb.WriteByte('\n')
+	}
+	sb.WriteString("-----END LPGP " + blockType + "-----\n")
+	return sb.String()
+}
+
+func dearmor(text string) (string, []byte, error) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if len(lines) < 4 {
+		return "", nil, errors.New("invalid armor")
+	}
+	begin := strings.TrimSpace(lines[0])
+	if !strings.HasPrefix(begin, "-----BEGIN LPGP ") || !strings.HasSuffix(begin, "-----") {
+		return "", nil, errors.New("invalid armor begin line")
+	}
+	blockType := strings.TrimSuffix(strings.TrimPrefix(begin, "-----BEGIN LPGP "), "-----")
+
+	i := 1
+	for i < len(lines) && strings.TrimSpace(lines[i]) != "" {
+		i++
+	}
+	if i >= len(lines) {
+		return "", nil, errors.New("missing armor body")
+	}
+	i++ // skip blank line
+
+	var body strings.Builder
+	endLine := "-----END LPGP " + blockType + "-----"
+	foundEnd := false
+
+	for ; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if line == endLine {
+			foundEnd = true
+			break
+		}
+		if strings.HasPrefix(line, "-----END LPGP ") {
+			return "", nil, errors.New("armor end type mismatch")
+		}
+		body.WriteString(line)
+	}
+	if !foundEnd {
+		return "", nil, errors.New("missing armor end line")
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(body.String())
+	if err != nil {
+		return "", nil, fmt.Errorf("base64 decode failed: %w", err)
+	}
+	return blockType, raw, nil
+}
+
+// ---------- keys ----------
+
+type publicKeyBundle struct {
+	kemPub []byte
+	sigPub []byte
+}
+
+type secretKeyBundle struct {
+	kemSeed []byte
+	sigSec  []byte
+}
+
+func keygen() ([]byte, []byte, error) {
+	dk, err := mlkem.GenerateKey768()
+	if err != nil {
+		return nil, nil, err
+	}
+	kemPub := dk.EncapsulationKey().Bytes()
+	kemSeed := dk.Bytes()
+
+	sigPub, sigSec, err := sigScheme.GenerateKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	sigPubBytes, err := sigPub.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	sigSecBytes, err := sigSec.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pub := encodeRecord(magicPub, kemPub, sigPubBytes)
+	sec := encodeRecord(magicSec, kemSeed, sigSecBytes)
+	return pub, sec, nil
+}
+
+func loadPublicKey(path string) (*publicKeyBundle, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	blockType, raw, err := dearmor(string(data))
+	if err != nil {
+		return nil, err
+	}
+	if blockType != pubBlock {
+		return nil, errors.New("not a public key block")
+	}
+	parts, err := decodeRecord(raw, magicPub, 2)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := mlkem.NewEncapsulationKey768(parts[0]); err != nil {
+		return nil, fmt.Errorf("invalid ML-KEM public key: %w", err)
+	}
+	if _, err := sigScheme.UnmarshalBinaryPublicKey(parts[1]); err != nil {
+		return nil, fmt.Errorf("invalid ML-DSA public key: %w", err)
+	}
+	return &publicKeyBundle{kemPub: parts[0], sigPub: parts[1]}, nil
+}
+
+func loadSecretKey(path string) (*secretKeyBundle, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	blockType, raw, err := dearmor(string(data))
+	if err != nil {
+		return nil, err
+	}
+	if blockType != secBlock {
+		return nil, errors.New("not a secret key block")
+	}
+	parts, err := decodeRecord(raw, magicSec, 2)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := mlkem.NewDecapsulationKey768(parts[0]); err != nil {
+		return nil, fmt.Errorf("invalid ML-KEM secret key seed: %w", err)
+	}
+	if _, err := sigScheme.UnmarshalBinaryPrivateKey(parts[1]); err != nil {
+		return nil, fmt.Errorf("invalid ML-DSA secret key: %w", err)
+	}
+	return &secretKeyBundle{kemSeed: parts[0], sigSec: parts[1]}, nil
+}
+
+// ---------- encrypt / decrypt ----------
+
+func encryptMessage(pk *publicKeyBundle, plaintext []byte) ([]byte, error) {
+	ek, err := mlkem.NewEncapsulationKey768(pk.kemPub)
+	if err != nil {
+		return nil, err
+	}
+	shared, kemCT := ek.Encapsulate()
+	defer zero(shared)
+
+	block, err := aes.NewCipher(shared)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := mustRand(gcm.NonceSize())
+	aad := append([]byte(encAAD), kemCT...)
+	aesCT := gcm.Seal(nil, nonce, plaintext, aad)
+
+	return encodeRecord(magicCT, kemCT, nonce, aesCT), nil
+}
+
+func decryptMessage(sk *secretKeyBundle, blob []byte) ([]byte, error) {
+	parts, err := decodeRecord(blob, magicCT, 3)
+	if err != nil {
+		return nil, err
+	}
+	kemCT, nonce, aesCT := parts[0], parts[1], parts[2]
+
+	dk, err := mlkem.NewDecapsulationKey768(sk.kemSeed)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := dk.Decapsulate(kemCT)
+	if err != nil {
+		return nil, err
+	}
+	defer zero(shared)
+
+	block, err := aes.NewCipher(shared)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(nonce) != gcm.NonceSize() {
+		return nil, errors.New("bad nonce size")
+	}
+
+	aad := append([]byte(encAAD), kemCT...)
+	return gcm.Open(nil, nonce, aesCT, aad)
+}
+
+// ---------- sign / verify ----------
+
+func signMessage(sk *secretKeyBundle, msg []byte) ([]byte, error) {
+	priv, err := sigScheme.UnmarshalBinaryPrivateKey(sk.sigSec)
+	if err != nil {
+		return nil, err
+	}
+	sig := sigScheme.Sign(priv, msg, &circlsign.SignatureOpts{Context: sigContext})
+	return encodeRecord(magicSig, sig), nil
+}
+
+func verifyMessage(pk *publicKeyBundle, blob, msg []byte) (bool, error) {
+	parts, err := decodeRecord(blob, magicSig, 1)
+	if err != nil {
+		return false, err
+	}
+	pub, err := sigScheme.UnmarshalBinaryPublicKey(pk.sigPub)
+	if err != nil {
+		return false, err
+	}
+	ok := sigScheme.Verify(pub, msg, parts[0], &circlsign.SignatureOpts{Context: sigContext})
+	return ok, nil
+}
+
+// ---------- commands ----------
+
 func cmdKeygen() {
-    fs := flag.NewFlagSet("keygen", flag.ExitOnError)
-    name := fs.String("name", "lattice", "base name for key files")
-    fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	name := fs.String("name", "lattice", "base name for key files")
+	fs.Parse(os.Args[2:])
 
-    fmt.Println("Generating Ring-LWE keypair ...")
-    pk, sk := KeyGen()
+	pubRaw, secRaw, err := keygen()
+	if err != nil {
+		fatalf("keygen failed: %v", err)
+	}
 
-    pubFile := *name + ".lpub"
-    secFile := *name + ".lsec"
+	pubPath := *name + ".lpub"
+	secPath := *name + ".lsec"
 
-    pubArmor := Armor("PUBLIC KEY BLOCK", pk.Marshal())
-    secArmor := Armor("SECRET KEY BLOCK", sk.Marshal())
+	if err := os.WriteFile(pubPath, []byte(armor(pubBlock, pubRaw)), 0644); err != nil {
+		fatalf("write public key: %v", err)
+	}
+	if err := os.WriteFile(secPath, []byte(armor(secBlock, secRaw)), 0600); err != nil {
+		fatalf("write secret key: %v", err)
+	}
 
-    if err := os.WriteFile(pubFile, []byte(pubArmor), 0644); err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-        os.Exit(1)
-    }
-    if err := os.WriteFile(secFile, []byte(secArmor), 0600); err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-        os.Exit(1)
-    }
-
-    fp := sha256.Sum256([]byte(pubArmor))
-    fmt.Printf("  Public key : %s\n", pubFile)
-    fmt.Printf("  Secret key : %s\n", secFile)
-    fmt.Printf("  Fingerprint: %x\n", fp[:])
-}
-
-func loadPubKey(path string) *PublicKey {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read public key: %v\n", err)
-        os.Exit(1)
-    }
-    _, raw, err := Dearmor(string(data))
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse armor: %v\n", err)
-        os.Exit(1)
-    }
-    pk, err := UnmarshalPublicKey(raw)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse public key: %v\n", err)
-        os.Exit(1)
-    }
-    return pk
-}
-
-func loadSecKey(path string) *SecretKey {
-    data, err := os.ReadFile(path)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read secret key: %v\n", err)
-        os.Exit(1)
-    }
-    _, raw, err := Dearmor(string(data))
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse armor: %v\n", err)
-        os.Exit(1)
-    }
-    sk, err := UnmarshalSecretKey(raw)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse secret key: %v\n", err)
-        os.Exit(1)
-    }
-    return sk
+	fp := sha256.Sum256(pubRaw)
+	fmt.Printf("Public key : %s\n", pubPath)
+	fmt.Printf("Secret key : %s\n", secPath)
+	fmt.Printf("Fingerprint: %x\n", fp[:])
 }
 
 func cmdEncrypt() {
-    fs := flag.NewFlagSet("encrypt", flag.ExitOnError)
-    pkFile := fs.String("pubkey", "", "public key file (.lpub)")
-    inFile := fs.String("in", "-", "input plaintext file")
-    outFile := fs.String("out", "-", "output ciphertext file")
-    fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("encrypt", flag.ExitOnError)
+	pubFile := fs.String("pubkey", "", "public key file")
+	inFile := fs.String("in", "-", "input plaintext")
+	outFile := fs.String("out", "-", "output ciphertext")
+	fs.Parse(os.Args[2:])
 
-    if *pkFile == "" {
-        fmt.Fprintln(os.Stderr, "ERROR: -pubkey required")
-        os.Exit(1)
-    }
+	if *pubFile == "" {
+		fatalf("-pubkey required")
+	}
 
-    pk := loadPubKey(*pkFile)
-    plain, err := readFileOrStdin(*inFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read input: %v\n", err)
-        os.Exit(1)
-    }
+	pk, err := loadPublicKey(*pubFile)
+	if err != nil {
+		fatalf("load public key: %v", err)
+	}
 
-    ct, err := EncryptMessage(pk, plain)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR encrypt: %v\n", err)
-        os.Exit(1)
-    }
+	plain, err := readFileOrStdin(*inFile)
+	if err != nil {
+		fatalf("read input: %v", err)
+	}
 
-    armored := Armor("ENCRYPTED MESSAGE BLOCK", ct)
-    writeFileOrStdout(*outFile, []byte(armored))
+	ct, err := encryptMessage(pk, plain)
+	if err != nil {
+		fatalf("encrypt: %v", err)
+	}
+
+	if err := writeFileOrStdout(*outFile, []byte(armor(ctBlock, ct)), 0644); err != nil {
+		fatalf("write output: %v", err)
+	}
 }
 
 func cmdDecrypt() {
-    fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
-    skFile := fs.String("seckey", "", "secret key file (.lsec)")
-    inFile := fs.String("in", "-", "input ciphertext file")
-    outFile := fs.String("out", "-", "output plaintext file")
-    fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
+	secFile := fs.String("seckey", "", "secret key file")
+	inFile := fs.String("in", "-", "input ciphertext")
+	outFile := fs.String("out", "-", "output plaintext")
+	fs.Parse(os.Args[2:])
 
-    if *skFile == "" {
-        fmt.Fprintln(os.Stderr, "ERROR: -seckey required")
-        os.Exit(1)
-    }
+	if *secFile == "" {
+		fatalf("-seckey required")
+	}
 
-    sk := loadSecKey(*skFile)
-    ctData, err := readFileOrStdin(*inFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read input: %v\n", err)
-        os.Exit(1)
-    }
+	sk, err := loadSecretKey(*secFile)
+	if err != nil {
+		fatalf("load secret key: %v", err)
+	}
 
-    _, raw, err := Dearmor(string(ctData))
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse armor: %v\n", err)
-        os.Exit(1)
-    }
+	armored, err := readFileOrStdin(*inFile)
+	if err != nil {
+		fatalf("read input: %v", err)
+	}
+	blockType, raw, err := dearmor(string(armored))
+	if err != nil {
+		fatalf("parse armor: %v", err)
+	}
+	if blockType != ctBlock {
+		fatalf("wrong block type: %s", blockType)
+	}
 
-    plain, err := DecryptMessage(sk, raw)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR decrypt: %v\n", err)
-        os.Exit(1)
-    }
+	plain, err := decryptMessage(sk, raw)
+	if err != nil {
+		fatalf("decrypt: %v", err)
+	}
 
-    writeFileOrStdout(*outFile, plain)
+	if err := writeFileOrStdout(*outFile, plain, 0644); err != nil {
+		fatalf("write output: %v", err)
+	}
 }
 
 func cmdSign() {
-    fs := flag.NewFlagSet("sign", flag.ExitOnError)
-    skFile := fs.String("seckey", "", "secret key file (.lsec)")
-    inFile := fs.String("in", "-", "input message file")
-    outFile := fs.String("out", "-", "output signature file")
-    fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("sign", flag.ExitOnError)
+	secFile := fs.String("seckey", "", "secret key file")
+	inFile := fs.String("in", "-", "input message")
+	outFile := fs.String("out", "-", "output signature")
+	fs.Parse(os.Args[2:])
 
-    if *skFile == "" {
-        fmt.Fprintln(os.Stderr, "ERROR: -seckey required")
-        os.Exit(1)
-    }
+	if *secFile == "" {
+		fatalf("-seckey required")
+	}
 
-    sk := loadSecKey(*skFile)
-    msg, err := readFileOrStdin(*inFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read input: %v\n", err)
-        os.Exit(1)
-    }
+	sk, err := loadSecretKey(*secFile)
+	if err != nil {
+		fatalf("load secret key: %v", err)
+	}
 
-    sig, err := Sign(sk, msg)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR sign: %v\n", err)
-        os.Exit(1)
-    }
+	msg, err := readFileOrStdin(*inFile)
+	if err != nil {
+		fatalf("read input: %v", err)
+	}
 
-    armored := Armor("SIGNATURE BLOCK", sig)
-    writeFileOrStdout(*outFile, []byte(armored))
+	sig, err := signMessage(sk, msg)
+	if err != nil {
+		fatalf("sign: %v", err)
+	}
+
+	if err := writeFileOrStdout(*outFile, []byte(armor(sigBlock, sig)), 0644); err != nil {
+		fatalf("write output: %v", err)
+	}
 }
 
 func cmdVerify() {
-    fs := flag.NewFlagSet("verify", flag.ExitOnError)
-    pkFile := fs.String("pubkey", "", "public key file (.lpub)")
-    sigFile := fs.String("sig", "", "signature file")
-    inFile := fs.String("in", "-", "original message file")
-    fs.Parse(os.Args[2:])
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	pubFile := fs.String("pubkey", "", "public key file")
+	sigFile := fs.String("sig", "", "signature file")
+	inFile := fs.String("in", "-", "input message")
+	fs.Parse(os.Args[2:])
 
-    if *pkFile == "" || *sigFile == "" {
-        fmt.Fprintln(os.Stderr, "ERROR: -pubkey and -sig required")
-        os.Exit(1)
-    }
+	if *pubFile == "" || *sigFile == "" {
+		fatalf("-pubkey and -sig required")
+	}
 
-    pk := loadPubKey(*pkFile)
-    msg, err := readFileOrStdin(*inFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read input: %v\n", err)
-        os.Exit(1)
-    }
+	pk, err := loadPublicKey(*pubFile)
+	if err != nil {
+		fatalf("load public key: %v", err)
+	}
 
-    sigData, err := os.ReadFile(*sigFile)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR read signature: %v\n", err)
-        os.Exit(1)
-    }
+	msg, err := readFileOrStdin(*inFile)
+	if err != nil {
+		fatalf("read input: %v", err)
+	}
 
-    _, raw, err := Dearmor(string(sigData))
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR parse armor: %v\n", err)
-        os.Exit(1)
-    }
+	armoredSig, err := os.ReadFile(*sigFile)
+	if err != nil {
+		fatalf("read signature: %v", err)
+	}
+	blockType, raw, err := dearmor(string(armoredSig))
+	if err != nil {
+		fatalf("parse armor: %v", err)
+	}
+	if blockType != sigBlock {
+		fatalf("wrong block type: %s", blockType)
+	}
 
-    valid, err := Verify(pk, raw, msg)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "ERROR verify: %v\n", err)
-        os.Exit(1)
-    }
-
-    if valid {
-        fmt.Println("GOOD SIGNATURE")
-    } else {
-        fmt.Println("BAD SIGNATURE")
-        os.Exit(1)
-    }
-}
-
-func main() {
-    if len(os.Args) < 2 {
-        usage()
-        os.Exit(1)
-    }
-    switch os.Args[1] {
-    case "keygen":
-        cmdKeygen()
-    case "encrypt":
-        cmdEncrypt()
-    case "decrypt":
-        cmdDecrypt()
-    case "sign":
-        cmdSign()
-    case "verify":
-        cmdVerify()
-    case "help", "-h", "--help":
-        usage()
-    default:
-        fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", os.Args[1])
-        usage()
-        os.Exit(1)
-    }
+	ok, err := verifyMessage(pk, raw, msg)
+	if err != nil {
+		fatalf("verify: %v", err)
+	}
+	if !ok {
+		fmt.Println("BAD SIGNATURE")
+		os.Exit(1)
+	}
+	fmt.Println("GOOD SIGNATURE")
 }
